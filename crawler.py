@@ -25,6 +25,8 @@ USER_AGENT = (
 DEFAULT_FONT_CANDIDATES = [
     Path("/Library/Fonts/Arial Unicode.ttf"),
 ]
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "Output"
+DEFAULT_USER_PAGE = "https://www.jianshu.com/u/a8f8f391aa46"
 
 
 class ArticlePDF(FPDF):
@@ -64,6 +66,38 @@ def _pick_font_path(cli_font: Optional[str]) -> Optional[Path]:
 
 def _contains_non_ascii(text: str) -> bool:
     return any(ord(ch) > 127 for ch in text)
+
+
+def fetch_user_article_urls(user_page: str, max_pages: int = 50) -> List[str]:
+    all_urls = set()
+    prefix = "https://www.jianshu.com/p/"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        )
+    }
+
+    for page in range(1, max_pages + 1):
+        params = {"page": page}
+        resp = requests.get(user_page, params=params, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            break
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        before = len(all_urls)
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("/p/") or href.startswith(prefix):
+                full_url = urljoin("https://www.jianshu.com", href).split("#", 1)[0]
+                if full_url.startswith(prefix):
+                    all_urls.add(full_url)
+
+        if len(all_urls) == before:
+            break
+
+    return sorted(all_urls)
 
 
 def fetch_article_html(url: str, session: requests.Session) -> str:
@@ -248,61 +282,194 @@ def _sanitize_filename(name: str) -> str:
     return cleaned or "article"
 
 
-def crawl(url: str, output: Optional[Path], font_path: Optional[Path]) -> None:
-    session = requests.Session()
-    page_html = fetch_article_html(url, session)
-    note_data = extract_note_payload(page_html)
+def _rename_output_with_title(output: Path, title: str) -> Path:
+    """Return a path that uses the article title as filename, avoiding collisions."""
+    sanitized = _sanitize_filename(title)
+    suffix = output.suffix or ".pdf"
+    candidate = output.with_name(f"{sanitized}{suffix}")
+    if candidate == output:
+        return output
+
+    counter = 1
+    while candidate.exists():
+        candidate = output.with_name(f"{sanitized}_{counter}{suffix}")
+        counter += 1
+    if candidate.parent != output.parent:
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+    return candidate
+
+
+def _ensure_title_filename(output: Path, title: str) -> Path:
+    """
+    Rename an existing file to the title-based filename when needed.
+    If the target name already exists, keep the existing one and leave the original untouched.
+    """
+    target = _rename_output_with_title(output, title)
+    if target == output:
+        return output
+
+    if target.exists():
+        # File is already stored with the title; keep as-is.
+        return target
+
+    if output.exists():
+        output.rename(target)
+        return target
+
+    return target
+
+
+def crawl(
+    url: str,
+    output: Path,
+    font_path: Optional[Path],
+    session: Optional[requests.Session] = None,
+    note_data: Optional[Dict] = None,
+) -> Path:
+    session = session or requests.Session()
+    if note_data is None:
+        page_html = fetch_article_html(url, session)
+        note_data = extract_note_payload(page_html)
 
     title = note_data.get("public_title") or "JianShu Article"
     author = note_data.get("user", {}).get("nickname")
     content_html = note_data.get("free_content", "")
     elements = parse_content_elements(content_html, url)
 
-    final_output = output or Path(f"{_sanitize_filename(title)}.pdf")
+    output = _rename_output_with_title(output, title)
 
     if not font_path and any(_contains_non_ascii(el.get("text", "")) for el in elements):
         print("[warn] Content includes non-ASCII characters; specify --font for correct rendering.")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         download_images(elements, session, Path(tmpdir))
-        render_pdf(title, author, elements, final_output, font_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        render_pdf(title, author, elements, output, font_path)
 
-    print(f"[ok] Saved PDF to {final_output}")
+    print(f"[ok] Saved PDF to {output}")
+    return output
+
+
+def _read_stdin_urls() -> List[str]:
+    urls: List[str] = []
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        urls.extend(line.split())
+    return urls
+
+
+def _slug_from_url(url: str) -> str:
+    return _sanitize_filename(Path(urlparse(url).path).name or "article")
+
+
+def _output_path_for_url(url: str, output_dir: Path, output_override: Optional[Path]) -> Path:
+    if output_override:
+        return output_override
+    slug = _slug_from_url(url)
+    return output_dir / f"{slug}.pdf"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Download a JianShu article to PDF.")
+    parser = argparse.ArgumentParser(description="Download JianShu articles to PDF.")
     parser.add_argument(
-        "url",
-        nargs="?",
-        help="Full JianShu article URL, e.g. https://www.jianshu.com/p/xxxx (will prompt if omitted)",
+        "urls",
+        nargs="*",
+        help="Optional whitespace-separated JianShu article URLs (skipped when --user-page is used).",
     )
     parser.add_argument(
         "-o",
         "--output",
         default=None,
-        help="Output PDF path (default: derived from article title, e.g. <title>.pdf)",
+        help="Output PDF path (only valid when a single URL is provided).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Directory for saving PDFs when multiple URLs are provided (default: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
         "--font",
         help="Path to a TTF font that supports the article language (defaults to Arial Unicode on macOS if present).",
     )
+    parser.add_argument(
+        "--user-page",
+        default=DEFAULT_USER_PAGE,
+        help="JianShu user page to crawl for article URLs "
+        f"(default: {DEFAULT_USER_PAGE}). If provided, URLs from this page are used and any positional URLs are ignored.",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=50,
+        help="Max pagination pages to scan when collecting URLs from the user page.",
+    )
     args = parser.parse_args()
 
-    url = args.url or input("Enter JianShu article URL: ").strip()
-    if not url:
-        parser.error("A JianShu article URL is required.")
+    urls: List[str] = []
+    if args.user_page:
+        urls = fetch_user_article_urls(args.user_page, max_pages=args.max_pages)
+    elif args.urls:
+        urls = list(args.urls)
+    elif not sys.stdin.isatty():
+        urls = _read_stdin_urls()
+
+    if not urls:
+        parser.error("No JianShu article URLs found from --user-page, stdin, or arguments.")
+
+    if args.output and len(urls) != 1:
+        parser.error("--output can only be used when downloading a single URL.")
 
     font_path = _pick_font_path(args.font)
     if args.font and not font_path:
         parser.error(f"Font file not found: {args.font}")
 
-    try:
-        output_path = Path(args.output) if args.output else None
-        crawl(url, output_path, font_path)
-    except Exception as exc:
-        print(f"[error] {exc}", file=sys.stderr)
-        sys.exit(1)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    failed: List[str] = []
+    total = len(urls)
+    session = requests.Session()
+    for idx, url in enumerate(urls, 1):
+        base_output = _output_path_for_url(url, output_dir, Path(args.output) if args.output else None)
+        note_data: Optional[Dict] = None
+        title_for_naming: Optional[str] = None
+        try:
+            page_html = fetch_article_html(url, session)
+            note_data = extract_note_payload(page_html)
+            title_for_naming = note_data.get("public_title") or "JianShu Article"
+        except Exception as exc:
+            print(f"[warn] Could not prefetch metadata for {url}: {exc}", file=sys.stderr)
+
+        if title_for_naming:
+            target_output = _rename_output_with_title(base_output, title_for_naming)
+            if target_output.exists():
+                print(f"[{idx}/{total}] Skip (titled exists) {target_output.name}")
+                continue
+            if base_output.exists():
+                renamed = _ensure_title_filename(base_output, title_for_naming)
+                print(f"[{idx}/{total}] Renamed to {renamed.name}")
+                continue
+        elif base_output.exists():
+            print(f"[{idx}/{total}] Skip (exists) {base_output.name}")
+            continue
+
+        print(f"[{idx}/{total}] Downloading {url}")
+        try:
+            crawl(url, base_output, font_path, session=session, note_data=note_data)
+        except Exception as exc:
+            print(f"[warn] Skipping {url}: {exc}", file=sys.stderr)
+            failed.append(url)
+            continue
+
+    if failed:
+        fail_log = output_dir / "failed_urls.txt"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with open(fail_log, "w", encoding="utf-8") as f:
+            for url in failed:
+                f.write(f"{url}\n")
+        print(f"[info] Recorded {len(failed)} failed URL(s) to {fail_log}")
 
 
 if __name__ == "__main__":
